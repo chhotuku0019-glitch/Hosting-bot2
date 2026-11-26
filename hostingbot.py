@@ -4,7 +4,7 @@ import os
 import zipfile
 import tempfile
 import shutil
-from telebot import types
+from telebot import types, util
 import time
 from datetime import datetime, timedelta
 # Removed unused telegram.* imports as we are using telebot consistently
@@ -78,6 +78,7 @@ user_files = {} # {user_id: [(file_name, file_type), ...]}
 active_users = set() # Set of all user IDs that have interacted with the bot
 admin_ids = {ADMIN_ID, OWNER_ID} # Set of admin IDs
 bot_locked = False
+force_channels = {} # {chat_id: {'title': str, 'link': str}} - force-join channels/groups
 # free_mode = False # Removed free_mode
 
 # --- Logging Setup ---
@@ -152,6 +153,8 @@ def init_db():
                      (user_id INTEGER, file_name TEXT, PRIMARY KEY (user_id, file_name))''')
         c.execute('''CREATE TABLE IF NOT EXISTS admins
                      (user_id INTEGER PRIMARY KEY)''') # Added admins table
+        c.execute('''CREATE TABLE IF NOT EXISTS force_channels
+                     (chat_id INTEGER PRIMARY KEY, title TEXT, link TEXT)''') # Force-join chats
         # Ensure owner and initial admin are in admins table
         c.execute('INSERT OR IGNORE INTO admins (user_id) VALUES (?)', (OWNER_ID,))
         if ADMIN_ID != OWNER_ID:
@@ -192,6 +195,11 @@ def load_data():
         c.execute('SELECT user_id FROM admins')
         admin_ids.update(user_id for (user_id,) in c.fetchall()) # Load admins into the set
 
+        # Load force-join chats
+        c.execute('SELECT chat_id, title, link FROM force_channels')
+        for chat_id, title, link in c.fetchall():
+            force_channels[chat_id] = {'title': title or str(chat_id), 'link': link}
+
         conn.close()
         logger.info(f"Data loaded: {len(active_users)} users, {len(user_subscriptions)} subscriptions, {len(admin_ids)} admins.")
     except Exception as e:
@@ -203,6 +211,10 @@ load_data()
 # --- End Database Setup ---
 
 # --- Helper Functions ---
+def md_esc(text):
+    """Escape Telegram legacy-Markdown special chars so names/bios with _ * ` [ never break a message."""
+    return re.sub(r'([_*`\[])', lambda m: '\\' + m.group(1), str(text))
+
 def get_user_folder(user_id):
     """Get or create user's folder for storing files"""
     user_folder = os.path.join(UPLOAD_BOTS_DIR, str(user_id))
@@ -267,7 +279,7 @@ def kill_process_tree(process_info):
             try:
                 process_info['log_file'].close()
                 log_file_closed = True
-                logger.info(f"Closed log file for {script_key} (PID: {process_info.get('process', {}).get('pid', 'N/A')})")
+                logger.info(f"Closed log file for {script_key} (PID: {getattr(process_info.get('process'), 'pid', 'N/A')})")
             except Exception as log_e:
                 logger.error(f"Error closing log file during kill for {script_key}: {log_e}")
 
@@ -905,6 +917,7 @@ def create_admin_panel():
         CInlineButton('➖ Remove Admin', callback_data='remove_admin')
     )
     markup.row(CInlineButton('📋 List Admins', callback_data='list_admins'))
+    markup.row(CInlineButton('📢 Force Join', callback_data='force_join'))
     markup.row(CInlineButton('🔙 Back to Main', callback_data='back_to_main'))
     return markup
 
@@ -1071,8 +1084,8 @@ def _logic_send_welcome(message):
     if user_id not in active_users:
         add_active_user(user_id)
         try:
-            owner_notification = (f"🎉 New user!\n👤 Name: {user_name}\n✳️ User: @{user_username or 'N/A'}\n"
-                                  f"🆔 ID: `{user_id}`\n📝 Bio: {user_bio}")
+            owner_notification = (f"🎉 New user!\n👤 Name: {md_esc(user_name)}\n✳️ User: @{md_esc(user_username or 'N/A')}\n"
+                                  f"🆔 ID: `{user_id}`\n📝 Bio: {md_esc(user_bio)}")
             bot.send_message(OWNER_ID, owner_notification, parse_mode='Markdown')
             if photo_file_id: bot.send_photo(OWNER_ID, photo_file_id, caption=f"Pic of new user {user_id}")
         except Exception as e: logger.error(f"⚠️ Failed to notify owner about new user {user_id}: {e}")
@@ -1091,7 +1104,7 @@ def _logic_send_welcome(message):
         else: user_status = "🆓 Free User (Expired Sub)"; remove_subscription_db(user_id) # Clean up expired
     else: user_status = "🆓 Free User"
 
-    welcome_msg_text = (f"〽️ Welcome, {user_name}!\n\n🆔 Your User ID: `{user_id}`\n"
+    welcome_msg_text = (f"〽️ Welcome, {md_esc(user_name)}!\n\n🆔 Your User ID: `{user_id}`\n"
                         f"✳️ Username: `@{user_username or 'Not set'}`\n"
                         f"🔰 Your Status: {user_status}{expiry_info}\n"
                         f"📁 Files Uploaded: {current_files} / {limit_str}\n\n"
@@ -1104,7 +1117,7 @@ def _logic_send_welcome(message):
         bot.send_message(chat_id, welcome_msg_text, reply_markup=main_reply_markup, parse_mode='Markdown')
     except Exception as e:
         logger.error(f"Error sending welcome to {user_id}: {e}", exc_info=True)
-        try: bot.send_message(chat_id, welcome_msg_text, reply_markup=main_reply_markup, parse_mode='Markdown') # Fallback without photo
+        try: bot.send_message(chat_id, welcome_msg_text.replace('`', '').replace('\\', ''), reply_markup=main_reply_markup) # Fallback: no photo, no Markdown
         except Exception as fallback_e: logger.error(f"Fallback send_message failed for {user_id}: {fallback_e}")
 
 def _logic_updates_channel(message):
@@ -1317,6 +1330,317 @@ def _logic_run_all_scripts(message_or_call):
     logger.info(f"Run all scripts finished. Admin: {admin_user_id}. Started: {started_count}. Skipped/Errors: {skipped_files}")
 
 
+# ===================== FORCE JOIN (channels / groups) =====================
+# Users must be members of ALL added chats before the bot works for them.
+# - Checked on EVERY message and EVERY button press (no cache): if a user leaves later, the join prompt comes back.
+# - No chats added  => force join is OFF (bot works normally). One chat or many => both work.
+# - Owner / admins are never blocked.
+# - Bot must be ADMIN in each added chat, otherwise Telegram does not let it check members.
+_FJ_ALERT_LAST = {}
+_FJ_BOT_ID = None
+_FJ_INVITE_RE = re.compile(r'^(?:https?://)?(?:www\.)?t\.me/(?:\+|joinchat/)([\w-]+)$', re.I)
+_FJ_PUBLIC_RE = re.compile(r'^(?:https?://)?(?:www\.)?t\.me/([A-Za-z]\w{3,31})(?:/.*)?$', re.I)
+_FJ_USER_RE = re.compile(r'^@?([A-Za-z]\w{3,31})$')
+_FJ_ID_RE = re.compile(r'^-?\d{5,}$')
+
+
+def _fj_bot_id():
+    global _FJ_BOT_ID
+    if _FJ_BOT_ID is None:
+        _FJ_BOT_ID = bot.get_me().id
+    return _FJ_BOT_ID
+
+
+def _api_err(e):
+    return getattr(e, 'description', None) or str(e)
+
+
+def fj_save(chat_id, title, link):
+    with DB_LOCK:
+        conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
+        try:
+            conn.execute('INSERT OR REPLACE INTO force_channels (chat_id, title, link) VALUES (?, ?, ?)', (chat_id, title, link))
+            conn.commit()
+            force_channels[chat_id] = {'title': title, 'link': link}
+            return True
+        except Exception as e:
+            logger.error(f"fj_save error: {e}", exc_info=True)
+            return False
+        finally: conn.close()
+
+
+def fj_remove(chat_id):
+    with DB_LOCK:
+        conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
+        try:
+            conn.execute('DELETE FROM force_channels WHERE chat_id = ?', (chat_id,))
+            conn.commit()
+            force_channels.pop(chat_id, None)
+            return True
+        except Exception as e:
+            logger.error(f"fj_remove error: {e}", exc_info=True)
+            return False
+        finally: conn.close()
+
+
+def _fj_alert_owner(chat_id, title, err):
+    now = time.time()
+    if now - _FJ_ALERT_LAST.get(chat_id, 0) < 1800: return  # max 1 alert / 30 min / chat
+    _FJ_ALERT_LAST[chat_id] = now
+    try:
+        bot.send_message(OWNER_ID, f"⚠️ Force-join check failed for '{title}' ({chat_id}).\nReason: {err}\n\n"
+                                   f"Make sure the bot is ADMIN there, or remove it from Admin Panel → Force Join.\n"
+                                   f"Users are NOT blocked for this chat until it is fixed.")
+    except Exception as e:
+        logger.error(f"Could not alert owner about force-join error: {e}")
+
+
+def _fj_is_member(chat_id, user_id, info):
+    try:
+        m = bot.get_chat_member(chat_id, user_id)
+        st = m.status
+        if st in ('creator', 'administrator', 'member'): return True
+        if st == 'restricted': return bool(getattr(m, 'is_member', True))
+        return False  # left / kicked
+    except telebot.apihelper.ApiTelegramException as e:
+        d = _api_err(e).lower()
+        if 'user not found' in d or 'participant' in d: return False
+        logger.error(f"Force-join check error for chat {chat_id}, user {user_id}: {d}")
+        _fj_alert_owner(chat_id, info.get('title', chat_id), _api_err(e))
+        return True  # bot misconfigured -> do not lock everybody out
+    except Exception as e:
+        logger.error(f"Force-join unexpected error chat {chat_id}, user {user_id}: {e}", exc_info=True)
+        return True
+
+
+def fj_missing_channels(user_id):
+    """[(chat_id, info), ...] the user has NOT joined. Empty list = allowed."""
+    if user_id in admin_ids or user_id == OWNER_ID: return []
+    missing = []
+    for cid, info in list(force_channels.items()):
+        if not _fj_is_member(cid, user_id, info): missing.append((cid, info))
+    return missing
+
+
+def _fj_prompt_markup(missing):
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    for cid, info in missing:
+        markup.add(CInlineButton(f"📢 Join {str(info.get('title') or cid)[:40]}", url=info['link'], style='primary'))
+    markup.add(CInlineButton("✅ I've Joined - Verify", callback_data='fj_verify', style='success'))
+    return markup
+
+
+def send_join_prompt(chat_id, missing):
+    text = ("🔒 Access Locked!\n\nTo use this bot you must join the channel(s)/group(s) below first.\n"
+            "After joining, tap ✅ Verify.\n\n(If you leave later, you will be asked to join again.)")
+    try:
+        bot.send_message(chat_id, text, reply_markup=_fj_prompt_markup(missing))
+    except Exception as e:
+        logger.error(f"Could not send join prompt to {chat_id}: {e}", exc_info=True)
+
+
+# --- Blockers: registered BEFORE every other handler, so they run first ---
+_FJ_MEDIA_TYPES = getattr(util, 'content_type_media',
+                          ['text', 'document', 'photo', 'video', 'audio', 'voice', 'sticker', 'animation',
+                           'video_note', 'contact', 'location', 'venue', 'poll', 'dice'])
+
+def _fj_block_message_check(message):
+    try:
+        if not force_channels: return False
+        if message.chat.type != 'private' or not message.from_user: return False
+        missing = fj_missing_channels(message.from_user.id)
+        if not missing: return False
+        message._fj_missing = missing
+        return True
+    except Exception as e:
+        logger.error(f"Force-join message check error: {e}", exc_info=True)
+        return False
+
+@bot.message_handler(func=_fj_block_message_check, content_types=_FJ_MEDIA_TYPES)
+def fj_block_message(message):
+    send_join_prompt(message.chat.id, getattr(message, '_fj_missing', None) or fj_missing_channels(message.from_user.id))
+
+def _fj_block_callback_check(call):
+    try:
+        if not force_channels or call.data == 'fj_verify': return False
+        missing = fj_missing_channels(call.from_user.id)
+        if not missing: return False
+        call._fj_missing = missing
+        return True
+    except Exception as e:
+        logger.error(f"Force-join callback check error: {e}", exc_info=True)
+        return False
+
+@bot.callback_query_handler(func=_fj_block_callback_check)
+def fj_block_callback(call):
+    try: bot.answer_callback_query(call.id, "🔒 Join the required channel(s) first!", show_alert=True)
+    except Exception: pass
+    send_join_prompt(call.from_user.id, getattr(call, '_fj_missing', None) or fj_missing_channels(call.from_user.id))
+
+def fj_verify_callback(call):
+    missing = fj_missing_channels(call.from_user.id)
+    if missing:
+        bot.answer_callback_query(call.id, "❌ You have not joined all the channels yet!", show_alert=True)
+        try: bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=_fj_prompt_markup(missing))
+        except Exception: pass  # "message is not modified" etc.
+        return
+    bot.answer_callback_query(call.id, "✅ Verified! Welcome.")
+    call.message.from_user = call.from_user  # call.message.from_user is the bot itself, welcome needs the real user
+    try: bot.delete_message(call.message.chat.id, call.message.message_id)
+    except Exception: pass
+    _logic_send_welcome(call.message)
+
+
+# --- Admin: manage force-join chats (Admin Panel -> Force Join, or /forcejoin) ---
+def create_force_join_menu():
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    markup.row(CInlineButton('➕ Add Channels', callback_data='fj_add'),
+               CInlineButton('➖ Remove Channel', callback_data='fj_remove'))
+    markup.row(CInlineButton('📋 List Channels', callback_data='fj_list'))
+    markup.row(CInlineButton('🔙 Back to Admin', callback_data='admin_panel'))
+    return markup
+
+def fj_menu_text():
+    n = len(force_channels)
+    state = f"🟢 ON ({n} chat{'s' if n != 1 else ''})" if n else "🔴 OFF (no chat added)"
+    return f"📢 Force Join\nStatus: {state}\n\nUsers must join ALL added channels/groups to use the bot."
+
+def _safe_edit(call, text, markup=None):
+    try:
+        bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=markup)
+    except telebot.apihelper.ApiTelegramException as e:
+        if 'message is not modified' not in str(e).lower():
+            logger.error(f"_safe_edit error: {e}")
+            try: bot.send_message(call.message.chat.id, text, reply_markup=markup)
+            except Exception: pass
+
+def force_join_menu_callback(call):
+    bot.answer_callback_query(call.id)
+    _safe_edit(call, fj_menu_text(), create_force_join_menu())
+
+def fj_add_init_callback(call):
+    bot.answer_callback_query(call.id)
+    msg = bot.send_message(call.message.chat.id,
+        "➕ Add Force-Join Channels/Groups\n\nSend one or many (one per line, or separated by space):\n"
+        "• @username  or  t.me/username  (public)\n"
+        "• -100xxxxxxxxxx ID (private) - optionally followed by its invite link\n"
+        "• or forward any message from that channel\n\n"
+        "⚠️ The bot must be ADMIN in every chat you add.\n/cancel to abort.")
+    bot.register_next_step_handler(msg, process_fj_add)
+
+def _forwarded_chat(message):
+    c = getattr(message, 'forward_from_chat', None)
+    if c: return c
+    fo = getattr(message, 'forward_origin', None)
+    return getattr(fo, 'chat', None) if fo is not None else None
+
+def _fj_parse_candidates(message):
+    cands = []  # {'ident': int | '@name', 'link': str | None}
+    notes = []
+    fwd = _forwarded_chat(message)
+    if fwd: cands.append({'ident': fwd.id, 'link': None})
+    text = (message.text or message.caption or '').strip()
+    for tok in re.split(r'[\s,;]+', text):
+        if not tok: continue
+        if _FJ_ID_RE.match(tok):
+            v = int(tok)
+            cands.append({'ident': v if v < 0 else int('-100' + tok), 'link': None})
+        elif _FJ_INVITE_RE.match(tok):
+            if cands and cands[-1]['link'] is None:
+                cands[-1]['link'] = 'https://t.me/' + re.sub(r'^(?:https?://)?(?:www\.)?t\.me/', '', tok, flags=re.I)
+            else: notes.append(f"❌ {tok}: invite link must come right AFTER the chat ID (or send the ID / forward a message).")
+        elif _FJ_PUBLIC_RE.match(tok):
+            cands.append({'ident': '@' + _FJ_PUBLIC_RE.match(tok).group(1), 'link': None})
+        elif _FJ_USER_RE.match(tok):
+            cands.append({'ident': '@' + _FJ_USER_RE.match(tok).group(1), 'link': None})
+        else: notes.append(f"❌ {tok}: not understood.")
+    seen, uniq = set(), []
+    for c in cands:
+        k = str(c['ident']).lower()
+        if k in seen: continue
+        seen.add(k); uniq.append(c)
+    return uniq, notes
+
+def _fj_try_add(cand):
+    ident = cand['ident']
+    try:
+        chat = bot.get_chat(ident)
+    except telebot.apihelper.ApiTelegramException as e:
+        return f"❌ {ident}: chat not found / bot is not in it ({_api_err(e)})"
+    except Exception as e:
+        return f"❌ {ident}: error {e}"
+    if chat.type not in ('channel', 'group', 'supergroup'):
+        return f"❌ {ident}: not a channel or group."
+    title = chat.title or str(chat.id)
+    try:
+        me = bot.get_chat_member(chat.id, _fj_bot_id())
+        if me.status not in ('administrator', 'creator'):
+            return f"❌ {title}: make the bot ADMIN there first."
+    except telebot.apihelper.ApiTelegramException as e:
+        return f"❌ {title}: bot cannot check members ({_api_err(e)}). Make it ADMIN."
+    link = cand['link'] or (f"https://t.me/{chat.username}" if getattr(chat, 'username', None) else None) or getattr(chat, 'invite_link', None)
+    if not link:
+        try: link = bot.export_chat_invite_link(chat.id)
+        except Exception: link = None
+    if not link:
+        return f"❌ {title}: private chat - send its invite link right after the ID (e.g. {chat.id} https://t.me/+abc...)."
+    if not fj_save(chat.id, title, link):
+        return f"❌ {title}: database error, check logs."
+    return f"✅ {title} added."
+
+def process_fj_add(message):
+    if message.from_user.id not in admin_ids: bot.reply_to(message, "⚠️ Admin only."); return
+    if (message.text or '').strip().lower() == '/cancel':
+        bot.reply_to(message, "Cancelled.", reply_markup=create_force_join_menu()); return
+    try:
+        cands, notes = _fj_parse_candidates(message)
+        if not cands:
+            msg = bot.reply_to(message, "⚠️ No valid channel/group found. Send @username, t.me link, -100 ID, or forward a message. /cancel to abort.")
+            bot.register_next_step_handler(msg, process_fj_add); return
+        lines = [_fj_try_add(c) for c in cands] + notes
+        bot.reply_to(message, "📢 Force Join result:\n\n" + "\n".join(lines) + f"\n\nTotal active: {len(force_channels)}",
+                     reply_markup=create_force_join_menu(), disable_web_page_preview=True)
+    except Exception as e:
+        logger.error(f"Error in process_fj_add: {e}", exc_info=True)
+        bot.reply_to(message, f"❌ Error: {e}")
+
+def _fj_remove_markup():
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    for cid, info in force_channels.items():
+        markup.add(CInlineButton(f"❌ Remove {str(info.get('title') or cid)[:40]}", callback_data=f"fj_del_{cid}"))
+    markup.add(CInlineButton('🔙 Back', callback_data='force_join'))
+    return markup
+
+def fj_remove_init_callback(call):
+    if not force_channels:
+        bot.answer_callback_query(call.id, "No chats added yet.", show_alert=True); return
+    bot.answer_callback_query(call.id)
+    _safe_edit(call, "➖ Tap a chat to remove it from force join:", _fj_remove_markup())
+
+def fj_delete_callback(call):
+    try: cid = int(call.data[len('fj_del_'):])
+    except ValueError:
+        bot.answer_callback_query(call.id, "Invalid data.", show_alert=True); return
+    info = force_channels.get(cid)
+    fj_remove(cid)
+    bot.answer_callback_query(call.id, f"Removed {(info or {}).get('title', cid)}")
+    if force_channels: _safe_edit(call, "➖ Tap a chat to remove it from force join:", _fj_remove_markup())
+    else: _safe_edit(call, fj_menu_text(), create_force_join_menu())
+
+def fj_list_callback(call):
+    bot.answer_callback_query(call.id)
+    if force_channels:
+        body = "\n".join(f"{i}. {info['title']}\n   {info['link']}\n   ID: {cid}" for i, (cid, info) in enumerate(force_channels.items(), 1))
+    else: body = "(none)"
+    _safe_edit(call, f"📋 Force Join chats:\n\n{body}", create_force_join_menu())
+
+@bot.message_handler(commands=['forcejoin'])
+def command_force_join(message):
+    if message.from_user.id not in admin_ids: bot.reply_to(message, "⚠️ Admin permissions required."); return
+    bot.reply_to(message, fj_menu_text(), reply_markup=create_force_join_menu())
+# ===================== END FORCE JOIN =====================
+
+
 # --- Command Handlers & Text Handlers for ReplyKeyboard ---
 @bot.message_handler(commands=['start', 'help'])
 def command_send_welcome(message): _logic_send_welcome(message)
@@ -1407,7 +1731,7 @@ def handle_file_upload_doc(message): # Renamed
         bot.reply_to(message, "⚠️ Unsupported type! Only `.py`, `.js`, `.zip` allowed.")
         return
     max_file_size = 20 * 1024 * 1024 # 20 MB
-    if doc.file_size > max_file_size:
+    if (doc.file_size or 0) > max_file_size:
         bot.reply_to(message, f"⚠️ File too large (Max: {max_file_size // 1024 // 1024} MB)."); return
 
     try:
@@ -1478,6 +1802,13 @@ def handle_callbacks(call):
         elif data == 'run_all_scripts': admin_required_callback(call, run_all_scripts_callback) # Added
         elif data == 'broadcast': admin_required_callback(call, broadcast_init_callback) 
         elif data == 'admin_panel': admin_required_callback(call, admin_panel_callback)
+        # --- Force join ---
+        elif data == 'fj_verify': fj_verify_callback(call)
+        elif data == 'force_join': admin_required_callback(call, force_join_menu_callback)
+        elif data == 'fj_add': admin_required_callback(call, fj_add_init_callback)
+        elif data == 'fj_remove': admin_required_callback(call, fj_remove_init_callback)
+        elif data.startswith('fj_del_'): admin_required_callback(call, fj_delete_callback)
+        elif data == 'fj_list': admin_required_callback(call, fj_list_callback)
         elif data == 'add_admin': owner_required_callback(call, add_admin_init_callback) 
         elif data == 'remove_admin': owner_required_callback(call, remove_admin_init_callback) 
         elif data == 'list_admins': admin_required_callback(call, list_admins_callback)
@@ -1915,7 +2246,7 @@ def back_to_main_callback(call):
             expiry_info = f"\n⏳ Subscription expires in: {days_left} days"
         else: user_status = "🆓 Free User (Expired Sub)" # Will be cleaned up by welcome if not already
     else: user_status = "🆓 Free User"
-    main_menu_text = (f"〽️ Welcome back, {call.from_user.first_name}!\n\n🆔 ID: `{user_id}`\n"
+    main_menu_text = (f"〽️ Welcome back, {md_esc(call.from_user.first_name)}!\n\n🆔 ID: `{user_id}`\n"
                       f"🔰 Status: {user_status}{expiry_info}\n📁 Files: {current_files} / {limit_str}\n\n"
                       f"👇 Use buttons or type commands.")
     try:
@@ -1940,7 +2271,8 @@ def stats_callback(call): # Called by user and admin
     # The logic is now inside _logic_statistics which determines what to show based on user_id
     # We need to pass a message-like object to _logic_statistics
     # For callbacks, call.message can be used.
-    _logic_statistics(call.message) 
+    call.message.from_user = call.from_user  # message.from_user is the bot itself; stats needs the real user
+    _logic_statistics(call.message)
     # To update the inline keyboard after showing stats, we need to edit the message
     try:
         bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id,
@@ -1978,7 +2310,7 @@ def broadcast_init_callback(call):
 def process_broadcast_message(message):
     user_id = message.from_user.id
     if user_id not in admin_ids: bot.reply_to(message, "⚠️ Not authorized."); return
-    if message.text and message.text.lower() == '/cancel': bot.reply_to(message, "Broadcast cancelled."); return
+    if message.text and (message.text or '').lower() == '/cancel': bot.reply_to(message, "Broadcast cancelled."); return
 
     broadcast_content = message.text # Can also handle photos, videos etc. if message.content_type is checked
     if not broadcast_content and not (message.photo or message.video or message.document or message.sticker or message.voice or message.audio): # If no text and no other media
@@ -2045,6 +2377,18 @@ def handle_cancel_broadcast(call):
         except: pass
 
 
+def _bc_send(uid, text, photo_id, video_id, caption):
+    """Send one broadcast item; if the Markdown is broken, resend as plain text."""
+    try:
+        if text: bot.send_message(uid, text, parse_mode='Markdown')
+        elif photo_id: bot.send_photo(uid, photo_id, caption=caption, parse_mode='Markdown' if caption else None)
+        elif video_id: bot.send_video(uid, video_id, caption=caption, parse_mode='Markdown' if caption else None)
+    except telebot.apihelper.ApiTelegramException as e:
+        if "can't parse entities" not in str(e).lower(): raise
+        if text: bot.send_message(uid, text)
+        elif photo_id: bot.send_photo(uid, photo_id, caption=caption)
+        elif video_id: bot.send_video(uid, video_id, caption=caption)
+
 def execute_broadcast(broadcast_text, photo_id, video_id, caption, admin_chat_id):
     sent_count = 0; failed_count = 0; blocked_count = 0
     start_exec_time = time.time() 
@@ -2054,13 +2398,7 @@ def execute_broadcast(broadcast_text, photo_id, video_id, caption, admin_chat_id
 
     for i, user_id_bc in enumerate(users_to_broadcast): # Renamed
         try:
-            if broadcast_text:
-                bot.send_message(user_id_bc, broadcast_text, parse_mode='Markdown')
-            elif photo_id:
-                bot.send_photo(user_id_bc, photo_id, caption=caption, parse_mode='Markdown' if caption else None)
-            elif video_id:
-                bot.send_video(user_id_bc, video_id, caption=caption, parse_mode='Markdown' if caption else None)
-            # Add other send methods for other types
+            _bc_send(user_id_bc, broadcast_text, photo_id, video_id, caption)
             sent_count += 1
         except telebot.apihelper.ApiTelegramException as e:
             err_desc = str(e).lower()
@@ -2073,9 +2411,7 @@ def execute_broadcast(broadcast_text, photo_id, video_id, caption, admin_chat_id
                 logger.warning(f"Flood control. Sleeping {retry_after}s...")
                 time.sleep(retry_after)
                 try: # Retry once
-                    if broadcast_text: bot.send_message(user_id_bc, broadcast_text, parse_mode='Markdown')
-                    elif photo_id: bot.send_photo(user_id_bc, photo_id, caption=caption, parse_mode='Markdown' if caption else None)
-                    elif video_id: bot.send_video(user_id_bc, video_id, caption=caption, parse_mode='Markdown' if caption else None)
+                    _bc_send(user_id_bc, broadcast_text, photo_id, video_id, caption)
                     sent_count += 1
                 except Exception as e_retry: logger.error(f"Broadcast retry failed to {user_id_bc}: {e_retry}"); failed_count +=1
             else: logger.error(f"Broadcast failed to {user_id_bc}: {e}"); failed_count += 1
@@ -2108,9 +2444,9 @@ def add_admin_init_callback(call):
 def process_add_admin_id(message):
     owner_id_check = message.from_user.id 
     if owner_id_check != OWNER_ID: bot.reply_to(message, "⚠️ Owner only."); return
-    if message.text.lower() == '/cancel': bot.reply_to(message, "Admin promotion cancelled."); return
+    if (message.text or '').lower() == '/cancel': bot.reply_to(message, "Admin promotion cancelled."); return
     try:
-        new_admin_id = int(message.text.strip())
+        new_admin_id = int((message.text or '').strip())
         if new_admin_id <= 0: raise ValueError("ID must be positive")
         if new_admin_id == OWNER_ID: bot.reply_to(message, "⚠️ Owner is already Owner."); return
         if new_admin_id in admin_ids: bot.reply_to(message, f"⚠️ User `{new_admin_id}` already Admin."); return
@@ -2133,9 +2469,9 @@ def remove_admin_init_callback(call):
 def process_remove_admin_id(message):
     owner_id_check = message.from_user.id
     if owner_id_check != OWNER_ID: bot.reply_to(message, "⚠️ Owner only."); return
-    if message.text.lower() == '/cancel': bot.reply_to(message, "Admin removal cancelled."); return
+    if (message.text or '').lower() == '/cancel': bot.reply_to(message, "Admin removal cancelled."); return
     try:
-        admin_id_remove = int(message.text.strip()) # Renamed
+        admin_id_remove = int((message.text or '').strip()) # Renamed
         if admin_id_remove <= 0: raise ValueError("ID must be positive")
         if admin_id_remove == OWNER_ID: bot.reply_to(message, "⚠️ Owner cannot remove self."); return
         if admin_id_remove not in admin_ids: bot.reply_to(message, f"⚠️ User `{admin_id_remove}` not Admin."); return
@@ -2168,9 +2504,9 @@ def add_subscription_init_callback(call):
 def process_add_subscription_details(message):
     admin_id_check = message.from_user.id 
     if admin_id_check not in admin_ids: bot.reply_to(message, "⚠️ Not authorized."); return
-    if message.text.lower() == '/cancel': bot.reply_to(message, "Sub add cancelled."); return
+    if (message.text or '').lower() == '/cancel': bot.reply_to(message, "Sub add cancelled."); return
     try:
-        parts = message.text.split();
+        parts = (message.text or '').split()
         if len(parts) != 2: raise ValueError("Incorrect format")
         sub_user_id = int(parts[0].strip()); days = int(parts[1].strip())
         if sub_user_id <= 0 or days <= 0: raise ValueError("User ID/days must be positive")
@@ -2199,9 +2535,9 @@ def remove_subscription_init_callback(call):
 def process_remove_subscription_id(message):
     admin_id_check = message.from_user.id
     if admin_id_check not in admin_ids: bot.reply_to(message, "⚠️ Not authorized."); return
-    if message.text.lower() == '/cancel': bot.reply_to(message, "Sub removal cancelled."); return
+    if (message.text or '').lower() == '/cancel': bot.reply_to(message, "Sub removal cancelled."); return
     try:
-        sub_user_id_remove = int(message.text.strip()) # Renamed
+        sub_user_id_remove = int((message.text or '').strip()) # Renamed
         if sub_user_id_remove <= 0: raise ValueError("ID must be positive")
         if sub_user_id_remove not in user_subscriptions:
             bot.reply_to(message, f"⚠️ User `{sub_user_id_remove}` no active sub in memory."); return
@@ -2224,9 +2560,9 @@ def check_subscription_init_callback(call):
 def process_check_subscription_id(message):
     admin_id_check = message.from_user.id
     if admin_id_check not in admin_ids: bot.reply_to(message, "⚠️ Not authorized."); return
-    if message.text.lower() == '/cancel': bot.reply_to(message, "Sub check cancelled."); return
+    if (message.text or '').lower() == '/cancel': bot.reply_to(message, "Sub check cancelled."); return
     try:
-        sub_user_id_check = int(message.text.strip()) # Renamed
+        sub_user_id_check = int((message.text or '').strip()) # Renamed
         if sub_user_id_check <= 0: raise ValueError("ID must be positive")
         if sub_user_id_check in user_subscriptions:
             expiry_dt = user_subscriptions[sub_user_id_check].get('expiry')
